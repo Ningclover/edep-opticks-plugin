@@ -123,76 +123,121 @@ set these for you.
 
 ## Environment Setup
 
-### Step 0: Create your `setup_env.sh`
+### Dependencies
 
-`setup_env.sh` is `.gitignored` because it hard-codes paths specific to one machine (spack view location, install prefixes, scratch folder, hostname). Copy the committed template and edit:
+The build finds all of its dependencies through the standard CMake
+`find_package` mechanism and `CMAKE_PREFIX_PATH` shell environment variable.  In
+cases where dependencies can not be found in this way, `cmake` can be given
+command line options to help in their location.
+
+Direct dependencies, each located via its own exported CMake config:
+
+| Package | Provides | Config directory (`<prefix>` = its install prefix) |
+|---|---|---|
+| `ROOT`     | Core, Tree, RIO                | `<prefix>/share/root/cmake/` |
+| `Geant4`   | Geant4 libraries               | `<prefix>/lib/cmake/Geant4/` |
+| `EDepSim`  | `EDepSim::edepsim`, `edepsim_io` | `<prefix>/lib/cmake/EDepSim/` |
+| `glm`      | `glm::glm`                     | `<prefix>/share/glm/` |
+| `simphony` | `simphony::{G4CX,U4,CSGOptiX,QUDARap,CSG,SysRap}` | `<prefix>/lib/cmake/simphony/` |
+
+The `simphony::*` imported targets carry their own include directories and pull
+in **plog, OptiX and the CUDA runtime** transitively, so the plugin never names
+those paths itself.  Simphony 0.8.0 is expected include commit 042a282 and then
+"gml" becomes a transitive dependency.
+
+The **C++ standard** is inherited from ROOT's build unless you explicitly pass
+`-DCMAKE_CXX_STANDARD=NN` to force a value.
+
+### Building the plugin
+
+First activate the environment that provides the dependencies, e.g. the Spack
+view used to build them:
 
 ```bash
-cp setup_env.example.sh setup_env.sh
-${EDITOR:-vi} setup_env.sh   # edit the "User-specific paths" block at the top
+source <prefix>/.envrc         
+## or: 
+# cd <prefix> && direnv allow
 ```
 
-After that, `source setup_env.sh` is the single command that prepares the environment — it handles everything in Step 2 below for you. The remaining steps in this section document what `setup_env.sh` is doing, in case you need to debug it.
-
-### Step 1: Activate the base spack environment
+**Minimal build config** — every dependency is found automatically because the
+activated environment put its prefixes on `CMAKE_PREFIX_PATH`, and the C++
+standard is taken from ROOT:
 
 ```bash
-source <prefix>/.envrc
-# or: cd <prefix> && direnv allow
+cmake -S . -B build
+cmake --build build -j
 ```
 
-This loads Geant4 11.2.2, ROOT 6.32.02, CMake 3.30.2, and GCC from the spack view.
-
-### Step 2: Set required environment variables
+**Maximal build config** — nothing is on `CMAKE_PREFIX_PATH`, so each dependency
+is pointed at explicitly and the C++ standard is pinned. Each `*_DIR` is the
+directory holding that package's `*Config.cmake` (see the table above):
 
 ```bash
-EICOPT_INST=<prefix>/simphony/install
-EDEPSIM_INST=<prefix>/edep-sim/install
-PLUGIN_BUILD=<path-to-this-repo>/build
+cmake -S . -B build \
+  -DCMAKE_CXX_STANDARD=23 \
+  -DROOT_DIR=/opt/root/share/root/cmake \
+  -DGeant4_DIR=/opt/geant4/lib/cmake/Geant4 \
+  -DEDepSim_DIR=/opt/edep-sim/lib/cmake/EDepSim \
+  -Dglm_DIR=/opt/glm/share/glm \
+  -Dsimphony_DIR=/opt/simphony/lib/cmake/simphony \
+  -DCUDAToolkit_ROOT=/usr/local/cuda
+cmake --build build -j
+```
 
-# Library search path (ORDER MATTERS — correct versions must come first)
-export LD_LIBRARY_PATH=\
-${EDEPSIM_INST}/lib:\
-${EICOPT_INST}/lib:\
-${PLUGIN_BUILD}:\
-/usr/local/cuda/lib64:\
-${LD_LIBRARY_PATH}
+> Simphony's transitive dependencies (CUDA, OptiX, plog, …) are normally resolved
+> from the same prefixes. If one lives somewhere unusual, hint it the same way —
+> e.g. `-DCUDAToolkit_ROOT=…` — or just prepend its prefix to
+> `-DCMAKE_PREFIX_PATH="/a;/b;/c"`.
 
-# Plugin shared library path
+### Runtime environment
+
+Running the plugin needs three *distinct kinds* of shell variable, kept separate
+below.
+
+**1. Placeholders** — local shell variables that are **not** part of any
+interface. Nothing reads them by these names; they exist only to build the real
+variables in groups 2 and 3. Edit them to match your machine.
+
+```bash
+PREFIX=/path/to/deps                 # spack view (or dependency install) prefix
+SIMPHONY_INST=${PREFIX}              # simphony prefix (holds lib/CSGOptiX7.ptx)
+PLUGIN_BUILD=/path/to/this/repo/build
+```
+
+**2. Standard PATH-like variables** — the loader search path understood by the
+OS. Order matters: the correctly-versioned libraries must come first.
+
+```bash
+export LD_LIBRARY_PATH=${PLUGIN_BUILD}:${PREFIX}/lib:${PREFIX}/lib64:${LD_LIBRARY_PATH}
+# add the CUDA runtime libdir here too if it is not already under ${PREFIX}
+```
+
+> **Warning**: do NOT add any directory containing old, conflicting copies of
+> Geant4, edep-sim or Simphony to `LD_LIBRARY_PATH` — they will shadow the
+> correct libraries and cause hard-to-diagnose symbol errors.
+
+**3. Plugin run-time options** — the actual runtime interface, read by the plugin
+and Simphony to select behavior:
+
+```bash
+# Shared library edep-sim loads, plus the physics-constructor hook.
 export PLUGIN_LIB=${PLUGIN_BUILD}/libedep-simphony-plugin.so
-
-# Instrumented Cerenkov/Scintillation physics (loaded before /run/initialize)
 export EXTRAPHYSICS="EXTERN:${PLUGIN_LIB}:CreatePhysicsConstructor"
 
-# Simphony mode: 1 = GPU-only (no CPU photon tracking)
-export OPTICKS_INTEGRATION_MODE=1
+# Opticks / Simphony integration
+export OPTICKS_INTEGRATION_MODE=1                        # 1 = GPU-only
+export CSGOptiX__ptxpath=${SIMPHONY_INST}/lib/CSGOptiX7.ptx
+export OPTICKS_MAX_SLOT=M1                               # GPU photon-slot cap (M1 = 1e6)
+export OPTICKS_OUT_FOLD=/path/to/scratch/opticks_output  # Simphony .npy output folder
 
-# Drift-field-aware photon yield: route edep-sim DokeBirks visE through
-# Local_DsG4Scintillation as the GPU photon-count source. Unset to revert
-# to the legacy SCINTILLATIONYIELD × inline-Birks path. (LAr-specific; W=19.5 eV)
-export EDEPSIM_DOKEBIRKS_VISE=1
-
-# Cap GPU photon-buffer slots. Default sizes for a 24 GB card and tries to
-# allocate ~12 GB; on a partly-used GPU this OOMs at QEvt::device_alloc_photon.
-# M1 = 1e6 slots ≈ 64 MB, enough for debug runs (<1e6 photons total per launch).
-# Raise for production-scale runs.
-export OPTICKS_MAX_SLOT=M1
-
-# PTX kernel path
-export CSGOptiX__ptxpath=${EICOPT_INST}/lib/CSGOptiX7.ptx
-
-# Output folder for Simphony numpy arrays (genstep.npy, hit.npy etc.)
-# Note: /tmp is often full on wcgpu1 — setup_env.sh uses /nfs/data/1/xning/tmp/opticks_output
-export OPTICKS_OUT_FOLD=/nfs/data/1/xning/tmp/opticks_output
+# Plugin knob (see "GPU Controls" below for the full EDEP_SIMPHONY_* set)
+export EDEPSIM_DOKEBIRKS_VISE=1                          # drift-field-aware photon yield
 ```
 
-The simplest path is to just `source setup_env.sh`, which sets all of the above (including `EDEPSIM_DOKEBIRKS_VISE=1` and `OPTICKS_MAX_SLOT=M1` by default) and skips the per-variable boilerplate.
+`macro/simphony_plugin.mac` refers to `$(PLUGIN_LIB)`, so that variable must be
+exported before the run. See **GPU Controls** for every `EDEP_SIMPHONY_*` knob.
 
-> **Warning**: Do NOT add any directory containing old conflicting versions of
-> Geant4, edepsim, or Simphony to `LD_LIBRARY_PATH`. These will override the
-> correctly-versioned libraries and cause symbol errors.
-
-### Step 3: Run
+### Run
 
 ```bash
 edep-sim -p QGSP_BERT \
