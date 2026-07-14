@@ -7,7 +7,12 @@ The **edep-Simphony plugin** (`libedep-simphony-plugin.so`) integrates **edep-si
 - edep-sim handles charged-particle physics (ionisation, EM showers) on CPU
 - When Cerenkov/Scintillation photons would be generated, they are collected as "gensteps" and handed to Simphony
 - Simphony ray-traces all photons in the event on GPU using OptiX
-- Both the CPU physics results and the GPU photon hits are written into one ROOT file
+- The GPU photon hits are written **into the standard `TG4Event` object** under
+  `PhotonDetectors["SimphonyPhotonDetector"]`, on equal footing with CPU-tracked
+  photons — so any consumer of `TG4Event` (edep-sim CLI ROOT file, Phlex, …)
+  sees them without knowing about the plugin. See
+  [`doc/photondetectors-conduit.md`](doc/photondetectors-conduit.md) for the
+  mechanism.
 
 > **Naming**: Simphony was formerly called *eic-opticks* (upstream is
 > [BNLNPPS/simphony](https://github.com/BNLNPPS/simphony)). The local checkout
@@ -42,19 +47,30 @@ edep-sim process (one event)
   │            │  CPU resumes after the GPU finishes
   │            ▼
   │  ┌─────────────────────────────── CPU (readout) ──────────────────────────────┐
-  ├─▶│ reads hits from SEvt → GPUPhotonHits  (recovers TrackId via provenance map) │
+  ├─▶│ reads hits from SEvt (recovers TrackId via genstep provenance map)         │
+  │  │   → EDepSim::HitSurface collection "SimphonyPhotonDetector/SimphonyHits"   │
+  │  │     picked up by the edep-sim PersistencyManager (ANY backend) and stored  │
+  │  │     as TG4Event.PhotonDetectors["SimphonyPhotonDetector"]                  │
+  │  │   → also the legacy flat GPUPhotonHits tree   (EDEP_SIMPHONY_LEGACY_HITTREE)│
   │  │ DebugHeavy/input-photon: walk ALL photons + their record buffer            │
   │  │   → GPUPhotonTracks (per-photon fate) + GPUPhotonSteps (full path)         │
   │  └────────────────────────────────────────────────────────────────────────────┘
   │
-  └─ edep-sim ROOT file (one file, up to 5 plugin trees + EDepSimEvents)
-       EDepSimEvents    ← CPU ionisation hits, trajectories, primaries
-       GPUPhotonHits    ← GPU detected optical hits                  (always)
+  └─ edep-sim ROOT file (EDepSimEvents + up to 5 plugin trees)
+       EDepSimEvents    ← TG4Event: ionisation, trajectories, primaries, AND
+       │                   PhotonDetectors["SimphonyPhotonDetector"] (GPU hits)
+       │                   + PhotonDetectors[<gdml-sd-name>] (CPU hits, DUAL)
+       GPUPhotonHits    ← GPU detected hits, legacy flat tree   (default on)
        GPUPhotonTracks  ← every GPU photon + final fate             (DebugHeavy)
        GPUPhotonSteps   ← every GPU bounce point (full path)        (DebugHeavy)
        CPUPhotonTracks  ← every CPU photon + final fate             (DUAL)
        CPUPhotonSteps   ← every CPU step point (full path)          (DUAL)
 ```
+
+> **No ROOT persistency manager?** (e.g. edep-sim embedded in Phlex): the GPU
+> hits still reach `TG4Event.PhotonDetectors` — that path needs no ROOT file at
+> all. The plugin TTrees then go to a plugin-owned fallback file
+> (`EDEP_SIMPHONY_DEBUG_FILE`, default `simphony_debug.root`).
 
 **CPU and GPU are strictly sequential**: the CPU blocks during `simulate()`, then resumes to collect hits. There is no overlap between events. The GPU box runs entirely inside the single `G4CXOpticks::simulate()` call.
 
@@ -89,12 +105,23 @@ set these for you.
   - OptiX 8.1.0 headers live at: `<prefix>/optix810-sdk/`
 - PTX kernel: `simphony/install/lib/CSGOptiX7.ptx`
 
-### 2. edep-sim (one source change)
+### 2. edep-sim (three source changes)
 - Source: `<prefix>/edep-sim/`
 - Install: `<prefix>/edep-sim/install/`
-- **One line changed** in `src/EDepSimUserEventAction.cc`: the external action loop
-  was moved before the `if (!HCofEvent) return` early exit, so the GPU plugin
-  runs even on events with no ionisation hits.
+- `src/EDepSimUserEventAction.cc` — the external action loop was moved before
+  the `if (!HCofEvent) return` early exit, so the GPU plugin runs even on
+  events with no ionisation hits.
+- `src/EDepSimHitSurface.{hh,cc}` — added a **value constructor**
+  (`HitSurface(primaryId, energyDeposit, position, start, pdg, creatorType,
+  creatorSubtype)`). The class has private fields and its only filling
+  constructor takes a `const G4Step*`; GPU photons have no step, so this is
+  what lets the plugin build the hits that reach
+  `TG4Event.PhotonDetectors`.
+- `src/EDepSimPersistencyManager.cc` — null-guards in
+  `SummarizePhotonDetectors` / `SummarizeSegmentDetectors`
+  (`if (!g4Hits || …)`). Fixes a segfault when a registered hit-collection
+  slot is not filled in a given event (possible for SDs that are not attached
+  to a volume, like the plugin's pseudo-SD).
 
 ### 3. Plugin library
 - Source: this repository
@@ -102,8 +129,9 @@ set these for you.
 
 | File | Role |
 |---|---|
-| `src/SimphonyRunAction.cc` | Reads the `EDEP_SIMPHONY_*` knobs and configures `SEventConfig` (DebugHeavy, MaxSlot/Photon/Record/Bounce) **before** `SEvt` is created; sets `KillOpticalPhotons` (off in DUAL); registers `LArTPCSensorIdentifier`; calls `SEvt::CreateOrReuse()` then `G4CXOpticks::SetGeometry()`; creates **all five** TTrees (`GPUPhotonHits`, `GPUPhotonTracks`, `GPUPhotonSteps`, `CPUPhotonTracks`, `CPUPhotonSteps`) and owns their static branch buffers |
-| `src/SimphonyEventAction.cc` | Calls `simulate()`; collects detected hits → `GPUPhotonHits`; in DebugHeavy/input-photon mode walks **all** GPU photons + their record buffer → `GPUPhotonTracks`/`GPUPhotonSteps`; recovers TrackId via genstep provenance; in input-photon mode captures primary optical photons and injects them as Opticks input photons |
+| `src/SimphonyRunAction.cc` | Reads the `EDEP_SIMPHONY_*` knobs and configures `SEventConfig` (DebugHeavy, MaxSlot/Photon/Record/Bounce) **before** `SEvt` is created; sets `KillOpticalPhotons` (off in DUAL); registers `LArTPCSensorIdentifier` **and the `SimphonyPhotonSD` pseudo-SD**; calls `SEvt::CreateOrReuse()` then `G4CXOpticks::SetGeometry()`; acquires the TTree file via `AcquireOutputFile()` (RootPersistencyManager's file when available, else a plugin-owned `EDEP_SIMPHONY_DEBUG_FILE`) and creates the plugin TTrees + their static branch buffers |
+| `src/SimphonyEventAction.cc` | Calls `simulate()`; converts detected hits to `EDepSim::HitSurface` and inserts the `SimphonyPhotonDetector/SimphonyHits` collection into the event (`FillPhotonDetectorHits`, **every** event — empty when no hits) so the persistency manager stores them in `TG4Event.PhotonDetectors`; also fills the legacy `GPUPhotonHits` tree; in DebugHeavy/input-photon mode walks **all** GPU photons + their record buffer → `GPUPhotonTracks`/`GPUPhotonSteps`; recovers TrackId via genstep provenance; in input-photon mode captures primary optical photons and injects them as Opticks input photons |
+| `src/SimphonyPhotonSD.hh` | Pseudo sensitive detector (never attached to a volume, `ProcessHits` unused): registers the `SimphonyPhotonDetector/SimphonyHits` hit-collection slot that `FillPhotonDetectorHits` fills and `SummarizePhotonDetectors` reads. The SD **name** is the provenance key that separates GPU hits from CPU hits inside `PhotonDetectors` |
 | `src/SimphonyStepAction.cc` | Records genstep index → G4 TrackID provenance map; logs DokeBirks dE/dx + photon-yield sampling; fills `CPUPhotonSteps` (every step of every CPU optical photon) |
 | `src/SimphonyCpuPhotonTracker.cc/.hh` | External `G4UserTrackingAction` (DUAL/CPU modes): records the **fate** of every CPU-tracked optical photon (detected, absorbed, WLS, escaped, …) → `CPUPhotonTracks`. Reads `G4OpBoundaryProcess::GetStatus()` only at a real geometry boundary to avoid stale `Detection` leaking onto bulk steps |
 | `src/SimphonyPhysicsSwap.cc` | Replaces G4Cerenkov/G4Scintillation with instrumented versions; in DUAL mode also installs a stock `G4Scintillation` (+ DokeBirks `AddSaturation`, stacking on) so the CPU produces real trackable photons |
@@ -272,6 +300,9 @@ hit-only path.
 | `EDEP_SIMPHONY_MAXSLOT` | GPU photon-slot / photon budget for DebugHeavy (record alloc = MaxSlot × MaxRecord). Capped small for debug runs to avoid CUDA OOM | `200000` (DebugHeavy) |
 | `EDEP_SIMPHONY_CERENKOV` | `0` = disable Cerenkov (scintillation-only comparison) | — |
 | `EDEP_SIMPHONY_SCINT` | Scint process: `thin` (`SimphonyScintProcess`, default) or `fork` (`Local_DsG4Scintillation`) | `thin` |
+| `EDEP_SIMPHONY_LEGACY_HITTREE` | `0` = do **not** write the legacy flat `GPUPhotonHits` tree. The same hits are always available in `TG4Event.PhotonDetectors["SimphonyPhotonDetector"]`; the tree is kept while old analysis scripts migrate | `1` (tree written) |
+| `EDEP_SIMPHONY_DEBUG_FILE` | Path for the plugin TTrees when the edep-sim ROOT persistency manager is **not** available (e.g. under Phlex). Ignored in normal CLI runs, where the trees go into the edep-sim output file | `simphony_debug.root` |
+| `EDEP_SIMPHONY_FORCE_NO_ROOTPM` | `1` = pretend the ROOT persistency manager is absent (test hook for the fallback path above) | unset |
 
 > **Record-length hard cap**: the per-photon GPU *flag-history* record is also
 > bounded by Opticks `sseq::SLOTS` (= `16 × NSEQ`, baked into
@@ -304,16 +335,49 @@ needs edep-sim's own trajectory saving turned on in the macro **before**
 
 ## Reading the Output ROOT File
 
-Depending on the run mode, the file holds up to five plugin TTrees alongside
-edep-sim's own `EDepSimEvents`:
+### GPU hits inside TG4Event (the primary record)
+
+The detected GPU hits are stored **inside each event** as `TG4PhotonHit`
+objects, keyed by sensitive-detector name — GPU photons under
+`SimphonyPhotonDetector`, CPU-tracked photons (DUAL mode) under the
+geometry's own SD name. This is the persistency-agnostic record: it exists in
+any context that stores `TG4Event`, with or without a ROOT file.
+
+```python
+import ROOT
+f = ROOT.TFile.Open("output.root")
+t = f.Get("EDepSimEvents")
+for i in range(t.GetEntries()):
+    t.GetEntry(i)
+    for sd, hits in t.Event.PhotonDetectors:   # sd = SD name string
+        for h in hits:
+            h.GetStop()        # detection position+time (TLorentzVector; mm, ns)
+            h.GetStart()       # creation point (zero unless DebugHeavy run)
+            h.GetWavelength()  # detected (post-WLS) wavelength
+            h.GetPrimaryId()   # stored-trajectory id of the charged parent
+            h.GetProcess()     # creator subtype: 21 Cerenkov / 22 Scint / 34 WLS
+```
+
+`tests_benchmark/check_photondet_migration.py` verifies these hits are 1:1
+identical with the legacy `GPUPhotonHits` tree.
+
+### Plugin TTrees
+
+Depending on the run mode, the file additionally holds up to five plugin
+TTrees alongside edep-sim's own `EDepSimEvents` (in a fallback
+`simphony_debug.root` when there is no ROOT persistency manager):
 
 | Tree | Written when | One row per | Contents |
 |---|---|---|---|
-| `GPUPhotonHits` | always | detected GPU photon | the detected optical hits |
+| `GPUPhotonHits` | `EDEP_SIMPHONY_LEGACY_HITTREE=1` (default) | detected GPU photon | **legacy** flat copy of the PhotonDetectors hits, kept while analysis scripts migrate |
 | `GPUPhotonTracks` | DebugHeavy / input-photon | every GPU photon | per-photon final **fate** (detected or not + why) |
 | `GPUPhotonSteps` | DebugHeavy / input-photon | every GPU step point | full bounce-by-bounce GPU path |
 | `CPUPhotonTracks` | DUAL + `CreateUserTrackAction` | every CPU optical photon | per-photon CPU **fate** |
 | `CPUPhotonSteps` | DUAL + photon-traj saving | every CPU step point | full CPU path |
+
+> Full per-photon **trajectories** live only in the `*PhotonSteps` trees —
+> `TG4Event` cannot hold them (`TG4PhotonHit` is start/stop only, and edep-sim's
+> internal trajectory store sparsifies photon paths to ~2 points by design).
 
 ```python
 import uproot
@@ -321,7 +385,7 @@ import numpy as np
 
 f = uproot.open("output.root")
 
-# GPU optical photon hits (always present)
+# GPU optical photon hits (legacy flat tree; same content as PhotonDetectors)
 hits = f["GPUPhotonHits"]
 print(hits.keys())
 # ['EventId', 'TrackId', 'Process', 'Wavelength', 'HitPos', 'StartPos']
@@ -426,6 +490,7 @@ for entry in t:
 |---|---|
 | Plugin source | this repository |
 | Plugin build | `build/` |
+| PhotonDetectors conduit doc | [`doc/photondetectors-conduit.md`](doc/photondetectors-conduit.md) — SEvt→HitSurface field mapping, required edep-sim patches, rationale |
 | Simphony repo | [github.com/Ningclover/simphony](https://github.com/Ningclover/simphony) — source `<prefix>/simphony/`, install `<prefix>/simphony/install/` |
 | edep-sim repo | [github.com/ClarkMcGrew/edep-sim](https://github.com/ClarkMcGrew/edep-sim) — source `<prefix>/edep-sim/`, install `<prefix>/edep-sim/install/` |
 | gegede (geometry tool) | [github.com/brettviren/gegede](https://github.com/brettviren/gegede) |

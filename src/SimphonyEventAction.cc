@@ -27,6 +27,18 @@
 #include <cstdlib>
 #include <vector>
 
+// GPU hits -> TG4Event.PhotonDetectors conduit
+#include "SimphonyPhotonSD.hh"
+#include "EDepSimHitSurface.hh"
+#include <G4EventManager.hh>
+#include <G4SDManager.hh>
+#include <G4HCofThisEvent.hh>
+#include <G4LorentzVector.hh>
+#include <G4OpticalPhoton.hh>
+#include <G4ProcessType.hh>
+#include <G4EmProcessSubType.hh>
+#include <G4OpProcessSubType.hh>
+
 // EDEP_SIMPHONY_INPUT_PHOTONS=1 -> capture the event's PRIMARY optical photons
 // and inject them into Opticks as input photons (instead of relying on
 // scintillation gensteps). Used by the pure-128nm-photon comparison so the GPU
@@ -213,10 +225,18 @@ int SimphonyEventAction::RecoverTrackId(int photonIndex) const
 void SimphonyEventAction::EndOfEventAction(const G4Event* event)
 {
     G4CXOpticks* gx = G4CXOpticks::Get();
-    if (!gx) { std::cout << "[SimphonyPlugin] EndOfEvent: G4CXOpticks::Get() = null\n"; return; }
+    if (!gx) {
+        std::cout << "[SimphonyPlugin] EndOfEvent: G4CXOpticks::Get() = null\n";
+        FillPhotonDetectorHits(event, 0);
+        return;
+    }
 
     SEvt* sev = SEvt::Get_EGPU();
-    if (!sev) { std::cout << "[SimphonyPlugin] EndOfEvent: SEvt::Get_EGPU() = null\n"; return; }
+    if (!sev) {
+        std::cout << "[SimphonyPlugin] EndOfEvent: SEvt::Get_EGPU() = null\n";
+        FillPhotonDetectorHits(event, 0);
+        return;
+    }
 
     // In input-photon mode the genstep is created inside simulate()'s
     // beginOfEvent(), so getNumGenstepCollected() is 0 here — gate on the
@@ -226,6 +246,7 @@ void SimphonyEventAction::EndOfEventAction(const G4Event* event)
     std::cout << "[SimphonyPlugin] EndOfEvent: ngenstep=" << ngenstep
               << (InputPhotonMode() ? " (input-photon mode)" : "") << "\n";
     if (!haveWork) {
+        FillPhotonDetectorHits(event, 0);   // empty collection, see below
         gx->reset(event->GetEventID());
         return;
     }
@@ -283,6 +304,13 @@ void SimphonyEventAction::EndOfEventAction(const G4Event* event)
         }
     }
 
+    // ── 2a. GPU hits → TG4Event.PhotonDetectors["SimphonyPhotonDetector"] ──
+    // Persistency-agnostic path (works in edep-sim CLI AND embedded contexts
+    // like Phlex): the edep-sim PersistencyManager picks this collection up in
+    // SummarizePhotonDetectors when it stores the event (which runs after this
+    // user action).
+    FillPhotonDetectorHits(event, nhit);
+
     // ── 2b. Save ALL photons (detected or not) + final fate, and the full
     //        per-photon trajectory (step record buffer). ────────────────────
     SaveAllPhotonsAndTrajectories(event, nphoton);
@@ -290,6 +318,94 @@ void SimphonyEventAction::EndOfEventAction(const G4Event* event)
     // ── 3. Reset SEvt for next event ─────────────────────────────────────
     gx->reset(event->GetEventID());
     fGenstepTrackIds.clear();
+}
+
+void SimphonyEventAction::FillPhotonDetectorHits(const G4Event* event,
+                                                 int64_t nhit)
+{
+    static int hcid = -2;   // resolve once; -1 = collection not registered
+    if (hcid == -2) {
+        hcid = G4SDManager::GetSDMpointer()->GetCollectionID(
+                   G4String(SimphonyPhotonSD::kSDName) + "/"
+                   + SimphonyPhotonSD::kHCName);
+    }
+    if (hcid < 0) return;
+
+    // Always insert the collection, even when empty: the pseudo-SD is not
+    // attached to a volume, so nothing else creates it, and consumers that
+    // walk the hit-collection table expect a registered slot to be non-null.
+    SEvt* sev = SEvt::Get_EGPU();
+    if (!sev) nhit = 0;
+
+    // The record buffer (present in DebugHeavy runs) provides each photon's
+    // creation point for TG4PhotonHit.Start; without it Start stays (0,0,0,0),
+    // which TG4PhotonHit documents as expected for offloaded photon tracking.
+    const NP* recNP = sev->topfold ? sev->topfold->get(SComp::RECORD_) : nullptr;
+    const sphoton* rec = recNP ? reinterpret_cast<const sphoton*>(recNP->bytes())
+                               : nullptr;
+    const int     maxRec     = recNP ? static_cast<int>(recNP->shape[1]) : 0;
+    const int64_t nRecPhoton = recNP ? recNP->shape[0] : 0;
+
+    const int pdgOptical
+        = G4OpticalPhoton::OpticalPhotonDefinition()->GetPDGEncoding();
+
+    auto* coll = new EDepSim::HitSurface::HitSurfaceCollection(
+                     SimphonyPhotonSD::kSDName, SimphonyPhotonSD::kHCName);
+
+    for (int64_t i = 0; i < nhit; ++i) {
+        sphoton p;
+        sev->getHit(p, static_cast<unsigned>(i));
+        const int pIdx = static_cast<int>(p.get_index());
+
+        // Creator process, mirroring what a CPU-tracked photon's HitSurface
+        // carries (process type + subtype of the process that created the
+        // arriving photon). Geant4 makes a NEW track at WLS re-emission whose
+        // creator is OpWLS, so a GPU photon that was re-emitted in flight
+        // (BULK_REEMIT in its history) reports OpWLS too, not its original
+        // generation process.
+        int creatorType = fUserDefined, creatorSubtype = 0;   // input/torch
+        if (p.flagmask & BULK_REEMIT) {
+            creatorType = fOptical;          creatorSubtype = fOpWLS;
+        } else if (p.flagmask & CERENKOV) {
+            creatorType = fElectromagnetic;  creatorSubtype = fCerenkov;
+        } else if (p.flagmask & SCINTILLATION) {
+            creatorType = fElectromagnetic;  creatorSubtype = fScintillation;
+        }
+
+        // Photon energy in G4 units from the wavelength (nm).
+        const double e = (p.wavelength > 0)
+                       ? h_Planck * c_light / (p.wavelength * nm) : 0.0;
+
+        G4LorentzVector position(p.pos.x, p.pos.y, p.pos.z, p.time);  // mm, ns
+        G4LorentzVector start(0, 0, 0, 0);
+        if (rec && maxRec > 0 && pIdx >= 0 && pIdx < nRecPhoton) {
+            const sphoton& r0 = rec[static_cast<int64_t>(maxRec) * pIdx];
+            if (r0.flag() != 0)
+                start.set(r0.pos.x, r0.pos.y, r0.pos.z, r0.time);
+        }
+
+        // Charged parent track that made the genstep; input/primary photons
+        // have no charged parent (same convention as GPUPhotonTracks).
+        const int primaryId = InputPhotonMode() ? -1 : RecoverTrackId(pIdx);
+        coll->insert(new EDepSim::HitSurface(
+            primaryId, e, position, start, pdgOptical,
+            creatorType, creatorSubtype));
+    }
+
+    G4Event* ev = G4EventManager::GetEventManager()->GetNonconstCurrentEvent();
+    G4HCofThisEvent* hce = ev ? ev->GetHCofThisEvent() : nullptr;
+    if (!hce) {
+        if (!ev) { delete coll; return; }
+        hce = new G4HCofThisEvent(
+                  G4SDManager::GetSDMpointer()->GetCollectionCapacity());
+        ev->SetHCofThisEvent(hce);
+    }
+    hce->AddHitsCollection(hcid, coll);
+
+    if (nhit > 0)
+        std::cout << "[SimphonyPlugin] EndOfEvent: " << nhit
+                  << " GPU hits -> PhotonDetectors['"
+                  << SimphonyPhotonSD::kSDName << "']\n";
 }
 
 // Decode the terminating-flag of a GPU photon into a short fate string and a

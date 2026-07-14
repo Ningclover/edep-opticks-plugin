@@ -41,11 +41,23 @@ public:
     static int64_t  sNewGenstepsThisRun;
 
 private:
+    /// Get the ROOT file the plugin trees should live in.  Two-tier fallback:
+    /// (1) the edep-sim RootPersistencyManager's file when that concrete
+    ///     manager is in use (edep-sim CLI) — trees land next to EDepSimEvents;
+    /// (2) otherwise (e.g. Phlex, where the persistency manager is a thin
+    ///     TG4Event-only class) a plugin-owned file, path from
+    ///     EDEP_SIMPHONY_DEBUG_FILE (default ./simphony_debug.root), closed in
+    ///     EndOfRunAction.
+    /// Returns nullptr if neither is available.
+    TFile* AcquireOutputFile();
+
     TTree* fGPUTree      = nullptr;
     TTree* fGPUTrackTree = nullptr;  // all photons + fate
     TTree* fGPUStepTree  = nullptr;  // full trajectory points
     TTree* fCPUTrackTree = nullptr;  // CPU photon fate
     TTree* fCPUStepTree  = nullptr;  // CPU full trajectory points
+
+    TFile* fOwnedFile    = nullptr;  // non-null only on fallback tier (2)
 
     static SimphonyRunAction* sInstance;
 };

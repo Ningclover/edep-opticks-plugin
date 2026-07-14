@@ -35,6 +35,12 @@ private:
     /// the full per-photon trajectory points to GPUPhotonSteps.
     void SaveAllPhotonsAndTrajectories(const G4Event* event, int64_t nphoton);
 
+    /// Convert the GPU hits to EDepSim::HitSurface objects and insert them as
+    /// the "SimphonyPhotonDetector/SimphonyHits" collection of this event, so
+    /// the edep-sim persistency manager (ANY backend) copies them into
+    /// TG4Event.PhotonDetectors["SimphonyPhotonDetector"].
+    void FillPhotonDetectorHits(const G4Event* event, int64_t nhit);
+
     /// Pure-photon mode (EDEP_SIMPHONY_INPUT_PHOTONS=1): capture the event's
     /// primary optical photons and inject them into Opticks as input photons.
     void InjectPrimaryPhotons(const G4Event* event);

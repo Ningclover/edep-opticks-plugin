@@ -17,6 +17,8 @@
 #include "SEventConfig.hh"
 #include "OpticksPhoton.hh"
 #include "LArTPCSensorIdentifier.h"
+#include "SimphonyPhotonSD.hh"
+#include <G4SDManager.hh>
 // OPTICKS_INTEGRATION_MODE=1 must be set in the environment for GPU-only mode.
 // G4CXOpticks::SetGeometry() calls SEvt::CreateOrReuse() internally.
 
@@ -280,28 +282,46 @@ void SimphonyRunAction::BeginOfRunAction(const G4Run* /*run*/)
     G4CXOpticks::SetGeometry(world);
     std::cout << "[SimphonyPlugin] G4CXOpticks geometry set, OptiX ready\n";
 
-    // ── 2. Create parallel GPU hit TTree in the edep-sim ROOT file ─────────
-    auto* pm = dynamic_cast<EDepSim::RootPersistencyManager*>(
-                   G4VPersistencyManager::GetPersistencyManager());
-    if (!pm || !pm->IsOpen()) {
-        std::cerr << "[SimphonyPlugin] WARNING: ROOT file not open yet; "
-                     "GPU hit tree will not be created.\n"
-                     "  Make sure /edep/db/open is called before /run/beamOn.\n";
-        return;
+    // ── 1b. Register the pseudo-SD for the GPU photon hits ────────────────
+    // Gives the G4 hit-collection table a "SimphonyPhotonDetector/SimphonyHits"
+    // slot; SimphonyEventAction fills it at end of event and the edep-sim
+    // persistency manager folds it into TG4Event.PhotonDetectors (works with
+    // ANY persistency backend, no RootPersistencyManager needed).
+    if (!G4SDManager::GetSDMpointer()->FindSensitiveDetector(
+            SimphonyPhotonSD::kSDName, /*warning=*/false)) {
+        G4SDManager::GetSDMpointer()->AddNewDetector(new SimphonyPhotonSD());
+        std::cout << "[SimphonyPlugin] Registered pseudo-SD '"
+                  << SimphonyPhotonSD::kSDName
+                  << "' (GPU hits -> TG4Event.PhotonDetectors)\n";
     }
 
-    TFile* f = pm->GetTFile();
+    // ── 2. Create the plugin TTrees (debug + legacy hits) ─────────────────
+    TFile* f = AcquireOutputFile();
+    if (!f) {
+        std::cout << "[SimphonyPlugin] No ROOT file available; plugin TTrees "
+                     "disabled (GPU hits still go to TG4Event.PhotonDetectors)\n";
+        return;
+    }
     f->cd();
 
-    fGPUTree = new TTree("GPUPhotonHits", "GPU optical photon hits (eic-opticks)");
-    fGPUTree->Branch("EventId",    &gEventId);
-    fGPUTree->Branch("TrackId",    &gTrackId);    // G4 TrackID of charged parent
-    fGPUTree->Branch("Process",    &gProcess);    // 0=Cerenkov, 2=Scintillation
-    fGPUTree->Branch("Wavelength", &gWavelength); // nm
-    fGPUTree->Branch("HitPos",    "TLorentzVector", &gHitPos);    // mm, ns
-    fGPUTree->Branch("StartPos",  "TLorentzVector", &gStartPos);  // mm, ns
-
-    std::cout << "[SimphonyPlugin] GPUPhotonHits TTree created in ROOT file\n";
+    // Legacy flat GPU hit tree. The same hits now also land in
+    // TG4Event.PhotonDetectors["SimphonyPhotonDetector"]; keep the tree while
+    // analysis scripts migrate. Disable with EDEP_SIMPHONY_LEGACY_HITTREE=0.
+    const char* legacy_c = std::getenv("EDEP_SIMPHONY_LEGACY_HITTREE");
+    const bool legacyTree = !legacy_c || !(std::string(legacy_c) == "0"
+                             || std::string(legacy_c) == "false"
+                             || std::string(legacy_c) == "off");
+    if (legacyTree) {
+        fGPUTree = new TTree("GPUPhotonHits",
+                             "GPU optical photon hits (eic-opticks)");
+        fGPUTree->Branch("EventId",    &gEventId);
+        fGPUTree->Branch("TrackId",    &gTrackId);    // G4 TrackID of charged parent
+        fGPUTree->Branch("Process",    &gProcess);    // 0=Cerenkov, 2=Scintillation
+        fGPUTree->Branch("Wavelength", &gWavelength); // nm
+        fGPUTree->Branch("HitPos",    "TLorentzVector", &gHitPos);    // mm, ns
+        fGPUTree->Branch("StartPos",  "TLorentzVector", &gStartPos);  // mm, ns
+        std::cout << "[SimphonyPlugin] GPUPhotonHits TTree created in ROOT file\n";
+    }
 
     // ── ALL photons (detected or not) + fate ──────────────────────────────
     fGPUTrackTree = new TTree("GPUPhotonTracks",
@@ -340,6 +360,41 @@ void SimphonyRunAction::BeginOfRunAction(const G4Run* /*run*/)
     std::cout << "[SimphonyPlugin] CPUPhotonTracks TTree created\n";
 }
 
+TFile* SimphonyRunAction::AcquireOutputFile()
+{
+    // Tier 1: the edep-sim CLI ROOT persistency manager's own file, so the
+    // plugin trees sit next to EDepSimEvents (historical behaviour). The
+    // downcast fails for other persistency managers (e.g. Phlex's thin
+    // TG4Event-only one) — that is expected, not an error.
+    // EDEP_SIMPHONY_FORCE_NO_ROOTPM=1 skips this tier (for testing tier 2).
+    const char* force_c = std::getenv("EDEP_SIMPHONY_FORCE_NO_ROOTPM");
+    const bool forceNoPM = force_c && (std::string(force_c) == "1"
+                             || std::string(force_c) == "true"
+                             || std::string(force_c) == "on");
+    if (!forceNoPM) {
+        auto* pm = dynamic_cast<EDepSim::RootPersistencyManager*>(
+                       G4VPersistencyManager::GetPersistencyManager());
+        if (pm && pm->IsOpen()) return pm->GetTFile();
+        std::cout << "[SimphonyPlugin] edep-sim RootPersistencyManager "
+                  << (pm ? "has no open file" : "not in use")
+                  << "; falling back to a plugin-owned debug file\n";
+    }
+
+    // Tier 2: a plugin-owned file. Written + closed in EndOfRunAction.
+    const char* path_c = std::getenv("EDEP_SIMPHONY_DEBUG_FILE");
+    const std::string path = path_c ? path_c : "simphony_debug.root";
+    fOwnedFile = TFile::Open(path.c_str(), "RECREATE");
+    if (!fOwnedFile || fOwnedFile->IsZombie()) {
+        std::cerr << "[SimphonyPlugin] WARNING: cannot open '" << path
+                  << "' for the plugin TTrees\n";
+        delete fOwnedFile;
+        fOwnedFile = nullptr;
+        return nullptr;
+    }
+    std::cout << "[SimphonyPlugin] plugin TTrees -> " << path << "\n";
+    return fOwnedFile;
+}
+
 void SimphonyRunAction::EndOfRunAction(const G4Run* /*run*/)
 {
     // ── Run-level debug summary (request items 4 & 5) ─────────────────────
@@ -355,6 +410,20 @@ void SimphonyRunAction::EndOfRunAction(const G4Run* /*run*/)
               << sTotalSimphonyGenstepPhotons
               << "  [sum of sgs.photons across all collected gensteps]\n"
               << "[SimphonyPlugin][DBG] =========================\n";
+
+    // Plugin-owned fallback file (tier 2): the edep-sim persistency manager
+    // knows nothing about it, so write + close it here. (In tier 1 the
+    // RootPersistencyManager writes the file on /edep/db/close.)
+    if (fOwnedFile) {
+        fOwnedFile->Write();
+        fOwnedFile->Close();
+        std::cout << "[SimphonyPlugin] plugin debug file written: "
+                  << fOwnedFile->GetName() << "\n";
+        delete fOwnedFile;
+        fOwnedFile = nullptr;
+        fGPUTree = fGPUTrackTree = fGPUStepTree = nullptr;
+        fCPUTrackTree = fCPUStepTree = nullptr;
+    }
 
     G4CXOpticks::Finalize();
     std::cout << "[SimphonyPlugin] G4CXOpticks finalized\n";
