@@ -95,13 +95,15 @@ Everything the plugin needs from edep-sim is contained in **two commits, six
 file changes**, on `integrate_eicoptics` at
 github.com/Ningclover/edep-sim (HEAD = `716a1ee`).
 
-Base: the branch forks from `466cc99`, which is on the
-**ClarkMcGrew/edep-sim `master` lineage** (NOT the DUNE/edep-sim fork, which
-has diverged separately). Clark's master has since advanced ~64 commits (to
-`4548701`, v4.3.0), including a rework of the trajectory-rule machinery and
-touches to `HitSurface` and the persistency manager — so the upstream PR
-should be a **rebase of these two commits onto Clark's current master**, not a
-raw branch merge.
+Base: the branch is on the **ClarkMcGrew/edep-sim `master` lineage** (NOT the
+DUNE/edep-sim fork, which has diverged separately). **Update (2026-07-14
+evening):** Clark's current master (`4548701`, v4.3.0, incl. his
+trajectory-rule rework) has been **merged into the branch** (merge commit
+`4b2a99b`, conflict-free — all three of our patches survived intact).
+edep-sim and the plugin were rebuilt against v4.3.0 and the full validation
+suite re-passed with identical deterministic results (10-event: 5518/2219,
+PhotonDetectors ≡ legacy 1:1; dualtraj: 575 CPU + 408 GPU). The branch is
+now directly PR-able against Clark's master with no rebase needed.
 
 Checked against Clark's `4548701` (2026-07-14): **neither patch is upstream
 yet** — `HitSurface` still has only the default and `G4Step` constructors,
