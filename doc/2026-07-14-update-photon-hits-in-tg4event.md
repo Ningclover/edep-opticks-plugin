@@ -103,6 +103,14 @@ touches to `HitSurface` and the persistency manager — so the upstream PR
 should be a **rebase of these two commits onto Clark's current master**, not a
 raw branch merge.
 
+Checked against Clark's `4548701` (2026-07-14): **neither patch is upstream
+yet** — `HitSurface` still has only the default and `G4Step` constructors,
+and both summarizers still dereference `GetHC()` unguarded. His PR #95
+(`bea3aae`, 7/7) is the *complement*, not a duplicate: it adds public read
+accessors (`GetEventSummary()`, `GetPhotonDetectors()`, …) for a derived thin
+persistency manager to hand `TG4Event` content out. So: his PR = the read
+side, our two patches = the write side (getting offloaded hits *in*).
+
 ### Commit `268ddde` (2026-04-28) — "Fix optical photon integration for GPU plugin support"
 
 | File | Change | Why necessary |
