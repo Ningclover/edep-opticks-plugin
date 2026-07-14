@@ -89,11 +89,19 @@ These two are the PR-able unit for upstream (they sit on top of the earlier
 `268ddde` "external actions before the no-hits early return" fix, which the
 plugin also needs).
 
-## Complete edep-sim patch set (branch `integrate_eicoptics` vs DUNE `master`)
+## Complete edep-sim patch set (branch `integrate_eicoptics`, based on Clark's `master`)
 
 Everything the plugin needs from edep-sim is contained in **two commits, six
 file changes**, on `integrate_eicoptics` at
-github.com/Ningclover/edep-sim (HEAD = `716a1ee`):
+github.com/Ningclover/edep-sim (HEAD = `716a1ee`).
+
+Base: the branch forks from `466cc99`, which is on the
+**ClarkMcGrew/edep-sim `master` lineage** (NOT the DUNE/edep-sim fork, which
+has diverged separately). Clark's master has since advanced ~64 commits (to
+`4548701`, v4.3.0), including a rework of the trajectory-rule machinery and
+touches to `HitSurface` and the persistency manager — so the upstream PR
+should be a **rebase of these two commits onto Clark's current master**, not a
+raw branch merge.
 
 ### Commit `268ddde` (2026-04-28) — "Fix optical photon integration for GPU plugin support"
 
