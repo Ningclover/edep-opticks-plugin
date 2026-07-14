@@ -89,6 +89,32 @@ These two are the PR-able unit for upstream (they sit on top of the earlier
 `268ddde` "external actions before the no-hits early return" fix, which the
 plugin also needs).
 
+## Complete edep-sim patch set (branch `integrate_eicoptics` vs DUNE `master`)
+
+Everything the plugin needs from edep-sim is contained in **two commits, six
+file changes**, on `integrate_eicoptics` at
+github.com/Ningclover/edep-sim (HEAD = `716a1ee`):
+
+### Commit `268ddde` (2026-04-28) — "Fix optical photon integration for GPU plugin support"
+
+| File | Change | Why necessary |
+|---|---|---|
+| `src/EDepSimUserEventAction.cc` | call the **external user actions before** the `if (!HCofEvent) return` early exit | the plugin's `EndOfEventAction` is where the GPU launch happens and (now) where the PhotonDetectors collection is inserted — it must run on **every** event, including events with no ionisation hits. Without this, such events lose their GPU photons and (post-migration) leave the hit-collection slot unfilled |
+| `src/EDepSimSurfaceSD.cc` | null-check the stacking action before calling `SetKillOpticalPhotons` | `SurfaceSD` assumed edep-sim's own stacking action is always installed; in the plugin's setup that assumption can fail → crash guard |
+| `src/EDepSimPersistencyManager.cc` | use `CreateAttValues()` instead of the deprecated `GetAttValues()` | fixes the trajectory-error diagnostic path that plugin-era running exercised |
+
+### Commit `716a1ee` (2026-07-14, latest) — "Support externally filled photon hits (GPU-offloaded transport)"
+
+| File | Change | Why necessary |
+|---|---|---|
+| `src/EDepSimHitSurface.hh/.cc` | new **value constructor** `HitSurface(primaryId, energyDeposit, position, start, pdg, creatorType, creatorSubtype)` | `HitSurface` is the **only** hit class `SummarizePhotonDetectors` accepts into `PhotonDetectors`, its fields are private with no setters, and its only filling constructor needs a `const G4Step*` — which offloaded (GPU) photons don't have. Pure initializer list; zero impact on existing callers and on the persistent `TG4PhotonHit`/ROOT I/O layer |
+| `src/EDepSimPersistencyManager.cc` | null-guards `if (!g4Hits \|\| g4Hits->GetSize()<1)` in `SummarizePhotonDetectors` **and** `SummarizeSegmentDetectors` | the `G4HCtable` lists every collection that *could* exist, but `GetHC(id)` returns **null** for a slot not filled this event. Volume-attached SDs always fill theirs in `Initialize()`; a detached SD (like the plugin's pseudo-SD) doesn't get `Initialize()` called — observed as a real segfault on an event with zero GPU hits. Makes a missing collection equivalent to an empty one |
+
+Everything else in our edep-sim working tree (DokeBirks debug prints,
+`.gitignore`, tutorial/test files) is debug or local housekeeping —
+deliberately **not** committed, so the branch is exactly the upstream-PR
+unit.
+
 ## Debug output (full trajectories) — kept, made portable
 
 We checked whether the full photon paths could move into `TG4Event` too: they
@@ -130,7 +156,7 @@ for sd, hits in t.Event.PhotonDetectors:
     print(sd, len(hits))     # 'SimphonyPhotonDetector' 236   (+ CPU SD in DUAL)
 ```
 
-## What this means for Brett / Phlex
+## What this means for Phlex
 
 - Nothing to implement on the Phlex side for the hits: if the thin persistency
   manager reuses `UpdateSummaries` (or calls `SummarizePhotonDetectors`), the
